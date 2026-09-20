@@ -1,0 +1,13 @@
+# Railway config-as-code for a single-instance SQLite demo.
+# Not expressible here (do it once in the Railway UI): the persistent VOLUME mounted at /data, and the environment variables.
+
+[build]
+# Default builder detects Next.js and runs `npm ci` then `npm run build`. Node is pinned by .node-version / package.json "engines".
+
+[deploy]
+startCommand = "npm start"          # `next start` binds 0.0.0.0 and honours Railway's PORT
+healthcheckPath = "/api/health"     # public, touches SQLite only, never calls Anthropic
+healthcheckTimeout = 120
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
+numReplicas = 1                     # SQLite is single-writer and the per-conversation lock is in-process: never scale past 1

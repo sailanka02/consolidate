@@ -32,6 +32,7 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+!.env.example
 
 # vercel
 .vercel
@@ -39,3 +40,16 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# consolidate local database
+/.consolidate/
+
+# local analysis/replay output: SQLite files here contain real conversation data
+/scratchpad/
+
+# any SQLite database, its WAL/shm sidecars, and backups: conversation data must never reach GitHub
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+/backups/
