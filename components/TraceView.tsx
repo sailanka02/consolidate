@@ -376,12 +376,35 @@ function AttemptCard({ a }: { a: AttemptView }) {
         {a.level === "full" && <span className="text-xs text-zinc-500">nothing removed</span>}
       </div>
       {a.full != null && <div className="mt-2"><Bar value={a.sent} max={Math.max(a.full, a.sent)} className={a.percent && a.percent > 0 ? "bg-gradient-to-r from-emerald-500 to-teal-400" : "bg-zinc-500"} height="h-1.5" /></div>}
-      {a.why && (
+      {a.warning && <p className="mt-2.5 rounded-lg bg-orange-500/10 px-3 py-2 text-xs leading-relaxed text-orange-200 ring-1 ring-orange-500/20">{a.warning}. The answer was returned as it is: nothing was added and it was not regenerated.</p>}
+      {a.retry && a.retry.decision !== "none" && <p className="mt-2.5 text-xs text-zinc-400"><span className="font-medium text-zinc-500">Then </span>{a.retry.label}{a.retry.decision === "corrective_regeneration" || a.retry.decision === "context_expansion" ? (a.retry.contextChanged ? " (context changed)" : " (context unchanged)") : ""}.</p>}
+      {a.retry && a.retry.decision === "none" && !a.passed && !a.warning && <p className="mt-2.5 text-xs text-zinc-500"><span className="font-medium">No retry: </span>{a.retry.reason}</p>}
+      {a.why && !a.warning && (
         <p className="mt-2.5 text-xs leading-relaxed text-zinc-400">
           <span className="font-medium text-zinc-500">Why? </span>{a.why}
         </p>
       )}
-      {a.added && (
+      {a.recovery && (
+        <div className="mt-2.5 space-y-1.5 rounded-lg bg-cyan-500/[0.06] px-3 py-2.5 text-xs leading-relaxed ring-1 ring-cyan-500/20">
+          <p className="font-semibold text-cyan-200">Missing context detected</p>
+          {a.recovery.needed && <p className="text-zinc-300"><span className="font-medium text-zinc-500">Needed </span>{a.recovery.needed}</p>}
+          <div>
+            <p className="font-medium text-zinc-500">Added</p>
+            <ul className="mt-0.5 space-y-1 pl-3">
+              {a.recovery.added.map((x, i) => (
+                <li key={i} className={`list-disc marker:text-cyan-400/60 ${x.skipped ? "text-zinc-600" : "text-zinc-300"}`}>
+                  {x.title} <span className="text-zinc-500">· {x.representation === "already_in_payload" ? "already in the payload" : x.representation === "memory" ? "as a memory note" : x.representation === "compressed" ? "as a compressed summary" : "original message"}{x.skipped ? " (not added)" : ""}</span>{" "}
+                  <span className="font-mono text-[11px] text-zinc-500">{x.tokens ? `~${fmt(x.tokens)} tok` : ""}</span>
+                  {x.kind === "partner" && <span className="block text-[11px] text-zinc-500">{x.why}</span>}
+                </li>
+              ))}
+            </ul>
+          </div>
+          <p className="text-zinc-300"><span className="font-medium text-zinc-500">Tokens added </span><span className="font-mono">~{fmt(a.recovery.tokensAdded)}</span> <span className="text-zinc-600">of a {fmt(a.recovery.budget)}-token budget{a.recovery.exceeded ? " (the required source alone exceeded it; nothing else was added)" : ""}</span></p>
+          <p className="text-zinc-400"><span className="font-medium text-zinc-500">Why </span>The evaluator identified this specific omitted information as necessary.</p>
+        </div>
+      )}
+      {a.added && !a.recovery && (
         <div className="mt-2.5 text-xs text-zinc-400">
           <p><span className="font-medium text-zinc-500">Added </span>{a.added.length === 0 ? "nothing — the same context was used again with a corrective instruction." : `${a.added.length} ${a.added.length === 1 ? "message" : "messages"}, ~${fmt(a.addedTokens)} tokens`}</p>
           {a.added.length > 0 && (

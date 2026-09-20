@@ -9,10 +9,11 @@
 import { annotationOf } from "./classify";
 import { findGroups, needsExactWording, representGroup, signature, summarizeExtractive, cacheKeyFor } from "./compress";
 import { formatMemoryBlock, memoryBlockTokens, memoryLineTokens } from "./memory";
+import { requiredPartner } from "./partner";
 import { detectReferentialObject, selectAntecedents } from "./referential";
 import { MEMORY_THRESHOLD, RETRIEVE_THRESHOLD, scoreRelevance } from "./relevance";
 import { buildMetrics, estimateMessages } from "./tokens";
-import type { Action, CompiledEntry, CompileResult, CompressedGroup, Decision, HistoryMessage, MemoryItem, ReferentialInfo } from "../types";
+import type { Action, CompiledEntry, CompileResult, CompressedGroup, Decision, ExpansionItem, ExpansionReport, HistoryMessage, MemoryItem, ReferentialInfo } from "../types";
 
 // Compression must pay for itself.
 const MIN_SAVED_TOKENS = 12;
@@ -30,6 +31,9 @@ const PREVIEW_LEN = 140;
 // Fallback level 1 may restore at most this many (local-estimate) tokens of omitted history. It is a cap, not a target:
 // restoring everything is what the full-context fallback is for.
 export const EXPAND_TOKEN_BUDGET = 800;
+// A recovery whose payload is at least this share of the full context is functionally the full context, and is recorded as
+// a full fallback rather than as "bounded expansion".
+export const FULL_EQUIVALENT_RATIO = 0.9;
 
 // Short follow-ups that point back at earlier context without naming it ("what else can I add?", "expand on that").
 // Their few words rarely overlap the earlier project description, so lexical retrieval alone misses the antecedent.
@@ -63,7 +67,9 @@ export type CompileInput = {
   //  includeIds   omitted messages the evaluator named as needed (restored in order, with their question/answer partner)
   //  incremental  when set, further omitted messages scoring >= minScore are restored best-first
   //  tokenBudget  cap on everything restored; the first named id is always restored even if it alone exceeds it
-  expansion?: { includeIds: string[]; tokenBudget: number; incremental?: { minScore: number } };
+  //  alreadySent  ids the initial compile already sent in ANY form (verbatim, memory note or compressed): recovery is a delta
+  //               on top of that, so these are never restored again (a compressed message keeps its cheaper representation)
+  expansion?: { includeIds: string[]; tokenBudget: number; incremental?: { minScore: number }; alreadySent?: string[] };
 };
 
 type Route = { action: Action; reason: string; groupId?: string; duplicateOf?: string; continuity?: boolean; antecedent?: boolean };
@@ -126,22 +132,74 @@ export function compileContext({ messages, request, memory = [], semanticMatches
     referentialInfo = { kind: referentialObject.kind, noun: referentialObject.noun, phrase: referentialObject.phrase, candidateIds: found.candidateIds, selectedIds: found.selectedIds, needsSearch: false };
   }
 
-  // Expanded retrieval (fallback level 1): explicitly requested messages come back verbatim, each with the other half
-  // of its question/answer pair, within the token budget.
+  // Expanded retrieval (fallback level 1). Recovery restores the MINIMUM information that repairs the identified omission:
+  //   1. the named source, in the cheapest faithful form that already exists (a memory line, a cached faithful summary,
+  //      or the original), unless it is already in the payload;
+  //   2. a conversational partner only when the named message cannot be interpreted without it (see partner.ts);
+  //   3. everything counts against ONE budget. The first named source is always restored even if it alone exceeds the
+  //      budget, but then nothing unrelated is added and the overrun is recorded.
+  // The initial compile's other decisions (including compression) are left exactly as they were.
   let budget = expansion?.tokenBudget ?? 0;
+  const report: ExpansionReport | undefined = expansion ? { budgetTokens: expansion.tokenBudget, usedTokens: 0, exceededByRequired: false, items: [] } : undefined;
+  const namedViaMemory = new Set<number>();
+  const forcedMemory = new Set<string>();
+  let closed = false; // once the required source has overrun the budget, no extras
+  const note = (i: number, item: Omit<ExpansionItem, "id" | "role" | "preview">) => report?.items.push({ id: messages[i].id, role: messages[i].role, preview: preview(messages[i].content), ...item });
   const restore = (i: number, reason: string) => {
     routes[i] = { action: "RETRIEVE", reason };
     budget -= tok[i];
   };
-  let restoredAny = false;
+  const alreadySent = new Set(expansion?.alreadySent ?? []);
+  let restoredNamed = 0;
   for (const id of expansion?.includeIds ?? []) {
     const i = idx.get(id);
-    if (i === undefined || routes[i] || (restoredAny && tok[i] > budget)) continue;
-    restore(i, "Restored by expanded retrieval: named as missing by the evaluator");
-    restoredAny = true;
-    const j = messages[i].role === "user" ? i + 1 : i - 1;
-    const partner = messages[j];
-    if (partner && partner.role !== messages[i].role && !routes[j] && tok[j] <= budget) restore(j, `Restored by expanded retrieval: question/answer partner of ${id}`);
+    if (i === undefined) continue;
+    if (routes[i] || alreadySent.has(id)) {
+      note(i, { kind: "named", representation: "already_in_payload", tokens: 0, why: `Already in the payload (${routes[i]?.action.toLowerCase() ?? "sent by the initial compile"}), so nothing was added.` });
+      continue;
+    }
+    // The cheapest faithful representation of the named message that already exists.
+    const mems = activeMemory.filter((m) => m.sourceIds.includes(id));
+    const memCost = mems.reduce((t, m) => t + memoryLineTokens(m), 0);
+    const s = summaries[id];
+    const summaryTokens = s ? estimateMessages([{ content: s.summary }]) : Infinity;
+    let representation: ExpansionItem["representation"] = "original";
+    let cost = tok[i];
+    if (ann[i].memoryComplete && mems.length && memCost < tok[i]) {
+      representation = "memory";
+      cost = memCost;
+    } else if (s && summaryTokens <= tok[i] * SEMANTIC_MAX_RATIO && tok[i] - summaryTokens >= MIN_SAVED_TOKENS) {
+      representation = "compressed";
+      cost = summaryTokens;
+    }
+    if (closed || (restoredNamed > 0 && cost > budget)) {
+      note(i, { kind: "named", representation, tokens: 0, skipped: true, why: "Named by the evaluator but not restored: the expansion budget was already used." });
+      continue;
+    }
+    if (representation === "memory") {
+      namedViaMemory.add(i);
+      mems.forEach((m) => forcedMemory.add(m.id));
+      budget -= cost;
+    } else if (representation === "compressed") {
+      const gid = `cg${groups.length + 1}`;
+      groups.push({ id: gid, kind: "summary", method: "semantic", sourceIds: [id], originalTokenEstimate: tok[i], compressedTokenEstimate: summaryTokens, summary: s!.summary, reason: "existing faithful summary used for recovery instead of the original", cacheKey: s!.cacheKey });
+      routes[i] = { action: "COMPRESS", reason: `Compressed into ${gid}`, groupId: gid };
+      budget -= cost;
+    } else restore(i, "Restored by expanded retrieval: named as missing by the evaluator");
+    restoredNamed++;
+    note(i, { kind: "named", representation, tokens: cost, why: "The evaluator identified this specific omitted information as necessary." });
+    if (budget < 0) {
+      report!.exceededByRequired = true;
+      closed = true;
+      continue;
+    }
+    const need = requiredPartner(messages, i);
+    if (need && !routes[need.index] && !namedViaMemory.has(need.index) && !alreadySent.has(messages[need.index].id)) {
+      if (tok[need.index] <= budget) {
+        restore(need.index, `Restored by expanded retrieval: needed to interpret ${id} (${need.why})`);
+        note(need.index, { kind: "partner", representation: "original", tokens: tok[need.index], why: `Needed to interpret the named message: ${need.why}.` });
+      } else note(need.index, { kind: "partner", representation: "original", tokens: 0, skipped: true, why: `Needed to interpret the named message (${need.why}) but over the expansion budget.` });
+    }
   }
 
   // Exact duplicates of context that is already kept verbatim.
@@ -159,7 +217,7 @@ export function compileContext({ messages, request, memory = [], semanticMatches
   const memRelevant = (m: MemoryItem) => (memoryScores.get(m.id) ?? 0) >= MEMORY_THRESHOLD;
   const alwaysCarried = (m: MemoryItem) => m.type === "constraint" || m.type === "preference";
   const eligible = activeMemory.filter((m) => {
-    if (!(alwaysCarried(m) || memRelevant(m))) return false;
+    if (!(alwaysCarried(m) || memRelevant(m) || forcedMemory.has(m.id))) return false;
     // A memory item whose every source is already kept verbatim adds nothing.
     return m.sourceIds.some((id) => {
       const i = idx.get(id);
@@ -234,8 +292,9 @@ export function compileContext({ messages, request, memory = [], semanticMatches
     } // small related-log groups fall through to per-message routing
   }
 
-  // C2. Verbose relevant prose: deterministic extractive summary of consecutive messages (skipped when expanding).
-  if (!expansion) {
+  // C2. Verbose relevant prose: deterministic extractive summary of consecutive messages. It also runs during recovery, so
+  // a message that was compressed in the initial compile stays compressed instead of silently coming back in full.
+  {
     const candidate = (i: number) => !routes[i] && relevant(i) && ["discussion", "fact", "decision"].includes(ann[i].contentType) && !needsExactWording(messages[i].content);
     for (let i = 0; i < n; i++) {
       if (!candidate(i)) continue;
@@ -268,7 +327,7 @@ export function compileContext({ messages, request, memory = [], semanticMatches
   // C3. Long relevant messages: model-written summaries (persisted and reused). Candidates are reported so the
   // caller can request them; supplied summaries are used only when they genuinely shrink the message.
   const summaryCandidates: string[] = [];
-  if (!expansion) {
+  {
     messages.forEach((m, i) => {
       if (routes[i] || !relevant(i) || tok[i] < SEMANTIC_SUMMARY_MIN_TOKENS) return;
       if (!["discussion", "fact", "decision", "other"].includes(ann[i].contentType)) return;
@@ -305,13 +364,17 @@ export function compileContext({ messages, request, memory = [], semanticMatches
   });
 
   // Expanded retrieval, incremental mode: bring back omitted messages best-scoring first until the budget is spent.
-  if (expansion?.incremental) {
+  if (expansion?.incremental && !closed) {
     const { minScore } = expansion.incremental;
     const pickable = messages
       .map((_, i) => i)
       .filter((i) => routes[i]!.action === "OMIT" && !routes[i]!.duplicateOf && scores[i].score >= minScore)
       .sort((a, b) => scores[b].score - scores[a].score || b - a);
-    for (const i of pickable) if (tok[i] <= budget) restore(i, "Restored by expanded retrieval (next best match within budget)");
+    for (const i of pickable) {
+      if (tok[i] > budget) continue;
+      restore(i, "Restored by expanded retrieval (next best match within budget)");
+      note(i, { kind: "scored", representation: "original", tokens: tok[i], score: scores[i].score, why: "Next best match within the expansion budget." });
+    }
   }
 
   // Lexical retrieval is "insufficient" when only continuity turns matched and the request is short or referential.
@@ -386,6 +449,27 @@ export function compileContext({ messages, request, memory = [], semanticMatches
   }
   const compiledContext = out.map((o) => o.entry);
 
+  // The report describes what was ACTUALLY sent: the final route of each restored message decides its representation and cost.
+  if (report) {
+    for (const item of report.items) {
+      if (item.skipped || item.representation === "already_in_payload") continue;
+      const i = idx.get(item.id)!;
+      const action = decisions[i].action;
+      if (action === "MEMORY") {
+        item.representation = "memory";
+        item.tokens = blockItems().filter((e) => e.sourceIds.includes(item.id)).reduce((t, e) => t + memoryLineTokens(e), 0);
+      } else if (action === "COMPRESS") {
+        item.representation = "compressed";
+        item.tokens = groups.find((g) => g.id === decisions[i].groupId)?.compressedTokenEstimate ?? item.tokens;
+      } else {
+        item.representation = "original";
+        item.tokens = tok[i];
+      }
+    }
+    report.usedTokens = report.items.filter((x) => !x.skipped).reduce((t, x) => t + x.tokens, 0);
+    if (report.usedTokens > report.budgetTokens) report.exceededByRequired = true;
+  }
+
   // Token accounting: each removed token is attributed to exactly one mechanism, so
   // original - compiled = omission + deduplication + compression + memory (memory net of its own block).
   const idsOf = (a: Action) => decisions.flatMap((d, i) => (d.action === a ? [i] : []));
@@ -407,7 +491,7 @@ export function compileContext({ messages, request, memory = [], semanticMatches
     totalItems: n,
   });
 
-  return { decisions, compiledContext, metrics, memoryInjected: memoryBlock, groups, savings, summaryCandidates, lexicallyInsufficient, referentialFollowUp, ...(referentialInfo && { referentialObject: referentialInfo }), requestTerms };
+  return { decisions, compiledContext, metrics, memoryInjected: memoryBlock, groups, savings, summaryCandidates, lexicallyInsufficient, referentialFollowUp, ...(report && { expansionReport: report }), ...(referentialInfo && { referentialObject: referentialInfo }), requestTerms };
 }
 
 // Full-context execution (fallback level 2): every message, in order, nothing removed.

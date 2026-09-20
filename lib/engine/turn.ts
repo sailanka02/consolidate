@@ -4,15 +4,16 @@
 // and the model is called only with the compiled context. All state is persisted through the repo layer.
 import "server-only";
 import type { DatabaseSync } from "node:sqlite";
-import { compileContext, EXPAND_TOKEN_BUDGET, fullContext, type SemanticSummary } from "../consolidate/compile";
+import { compileContext, EXPAND_TOKEN_BUDGET, FULL_EQUIVALENT_RATIO, fullContext, type SemanticSummary } from "../consolidate/compile";
 import { ANTECEDENT_WINDOW } from "../consolidate/referential";
 import { maxRequestTokens } from "../runtime-config";
 import { annotateMessage } from "../consolidate/classify";
 import { cacheKeyFor } from "../consolidate/compress";
 import { evaluateAnswer, evaluateContext } from "../consolidate/evaluate";
 import { applyStatements, extractStatements, memoryLineTokens, type MemoryChange } from "../consolidate/memory";
-import { analyzeAmbiguous, evaluateAnswerSemantically, SEMANTIC_RETRIEVAL_SCORE, selectRelevant, summarizeMessages } from "../consolidate/semantic";
-import { decideEconomics, economicsMargin, expectedEvalUsage, HISTORY_WINDOW } from "../consolidate/economics";
+import { analyzeAmbiguous, evaluateAnswerSemantically, SEMANTIC_RETRIEVAL_SCORE, selectRelevant, summarizeMessages, type Requirement, type SemanticVerdict } from "../consolidate/semantic";
+import { decideEconomics, economicsMargin, expectedEvalUsage, expectedEvaluationCostUsd, HISTORY_WINDOW } from "../consolidate/economics";
+import { proposeRetry, type RetryProposal } from "../consolidate/retry";
 import { contextSize, economics } from "../consolidate/measure";
 import { estimateMessages, estimateText } from "../consolidate/tokens";
 import { buildTrace } from "../consolidate/trace";
@@ -20,7 +21,7 @@ import * as repo from "../db/repo";
 import { configuredModels } from "../model/config";
 import { usageCost } from "../model/pricing";
 import { ProviderError, type ModelProvider, type ModelResult } from "../model";
-import type { Annotation, AttemptTrace, BenchmarkResult, BenchmarkSide, ChatMessage, CompiledEntry, CompileResult, ContextTrace, CostSummary, EvalCheck, FailureCategory, GenerationUsage, HistoryMessage, MemoryStatement, RunSummary, TokenCount, UtilityCall } from "../types";
+import type { Annotation, AttemptTrace, BenchmarkResult, BenchmarkSide, ChatMessage, CompiledEntry, CompileResult, ContextTrace, CostSummary, EvalCheck, FailureCategory, GenerationUsage, RetryDecision, HistoryMessage, MemoryStatement, RunSummary, TokenCount, UtilityCall } from "../types";
 
 export type TurnOptions = {
   conversationId: string;
@@ -42,39 +43,6 @@ export type TurnResult = { userMessage: ChatMessage; assistantMessage: ChatMessa
 const ANALYZE_LIMIT = 30; // ambiguous messages classified per request
 const SUMMARY_LIMIT = 6; // long messages summarized per request
 const RETRIEVAL_DIGESTS = 80;
-const USEFUL_SCORE = 0.01; // an omitted message scoring at least this has some evidence of relevance
-
-// What level 1 may restore for a failed attempt. Only failures that more history can plausibly fix get a plan;
-// a weak answer, a violated instruction or an unsupported claim is not repaired by sending more of the conversation.
-type ExpansionPlan = { includeIds: string[]; incremental?: { minScore: number } };
-function expansionPlan(a: { trace: AttemptTrace; missingIds: string[] }): ExpansionPlan | null {
-  switch (a.trace.failureCategory) {
-    case "MISSING_CONTEXT": // named messages only; if none were named, best-scoring omitted messages within the budget
-      return a.missingIds.length ? { includeIds: a.missingIds } : { includeIds: [], incremental: { minScore: 0 } };
-    case "UNCERTAIN": // one bounded try, and only with omitted context that shows some relevance
-      return { includeIds: a.missingIds, incremental: { minScore: USEFUL_SCORE } };
-    case "CHECK_FAILED":
-      return { includeIds: [], incremental: { minScore: 0 } };
-    default:
-      return null;
-  }
-}
-
-// Failures a better answer (not more history) can fix: ask once more with the SAME optimized context and a corrective instruction.
-const REGENERATION_GUIDANCE: Partial<Record<FailureCategory, string>> = {
-  ANSWER_QUALITY: "Your previous reply to this request was judged weak or incomplete. Answer it again, directly and completely, using only the conversation context provided.",
-  INSTRUCTION_VIOLATION:
-    "Your previous reply contradicted a standing requirement that applies to this request. Answer again and follow every requirement, constraint and preference in the provided context that applies to it (a requirement about an unrelated subject does not apply and need not be mentioned).",
-  UNSUPPORTED_CLAIM:
-    "Your previous reply stated things about the conversation that the provided context does not support. Answer again and ground every statement about the conversation in the provided context; if the context does not contain something, say so instead of guessing.",
-};
-function regenerationGuidance(a: { trace: AttemptTrace }): string | null {
-  const base = a.trace.failureCategory ? REGENERATION_GUIDANCE[a.trace.failureCategory] : undefined;
-  if (!base) return null;
-  const note = a.trace.checks.filter((c) => c.layer === "semantic" && !c.passed && c.reason).map((c) => c.reason).join(" ").slice(0, 300);
-  return note ? `${base} Reviewer note: ${note}` : base;
-}
-
 const inFlight = ((globalThis as unknown as { __consolidateInFlight?: Set<string> }).__consolidateInFlight ??= new Set<string>());
 
 export class TurnError extends Error {
@@ -88,7 +56,7 @@ export class TurnError extends Error {
 
 const ms = (t0: number) => Math.round(performance.now() - t0);
 
-type Attempt = { trace: AttemptTrace; missingIds: string[] };
+type Attempt = { trace: AttemptTrace; missingIds: string[]; verdict: SemanticVerdict | null; semanticReason: string };
 
 export async function runTurn(db: DatabaseSync, provider: ModelProvider, opts: TurnOptions): Promise<TurnResult> {
   const request = opts.content.trim();
@@ -267,9 +235,10 @@ async function execute(db: DatabaseSync, provider: ModelProvider, opts: TurnOpti
 
   // ---- 8: execute, evaluate, fall back ----
   const evalContext = (r: CompileResult, entries: CompiledEntry[]) => evaluateContext({ ...r, compiledContext: entries }, msgs, active(), request);
-  const requirements = [
-    ...msgs.filter((m) => m.annotation?.protection).map((m) => m.content),
-    ...active().filter((m) => m.type === "constraint" || m.type === "preference").map((m) => `${m.key}: ${m.value}`),
+  // Standing requirements with ids, so an evaluator that claims a violation must cite a real source.
+  const requirements: Requirement[] = [
+    ...msgs.filter((m) => m.annotation?.protection).map((m) => ({ id: m.id, text: m.content })),
+    ...active().filter((m) => m.type === "constraint" || m.type === "preference").map((m) => ({ id: `memory:${m.key}`, text: `${m.key}: ${m.value}` })),
   ];
 
   const semanticUsedFlag: { used: boolean; skip?: string } = { used: false };
@@ -330,6 +299,7 @@ async function execute(db: DatabaseSync, provider: ModelProvider, opts: TurnOpti
     let checks: EvalCheck[] = [...(r ? evalContext(r, entries).checks : []), ...evaluateAnswer(response, error)];
     let missingIds: string[] = [];
     let semanticCategory: FailureCategory = "PASS";
+    let verdictOut: SemanticVerdict | null = null;
     const skip = !r ? "full context sent; nothing removed" : r.metrics.tokensAvoided <= 0 ? "nothing was removed from context, so the answer equals the full-context answer" : undefined;
     if (r && !skip && !error) {
       const omitted = r.decisions.filter((d) => d.action === "OMIT" && !d.duplicateOf).sort((a, b) => b.score - a.score || b.tokens - a.tokens).map((d) => ({ id: d.id, text: msgs.find((m) => m.id === d.id)!.content }));
@@ -338,6 +308,7 @@ async function execute(db: DatabaseSync, provider: ModelProvider, opts: TurnOpti
       if (verdict) {
         for (const c of verdict.criteria) checks.push({ name: `Semantic: ${c.name.replace(/_/g, " ")}`, passed: c.pass, reason: c.reason, layer: "semantic" });
         semanticCategory = verdict.category;
+        verdictOut = verdict;
         if (verdict.category === "UNCERTAIN") checks.push({ name: "Semantic verdict", passed: false, reason: "evaluator was uncertain; treated as not validated", layer: "semantic" });
         else if (verdict.category !== "PASS" && verdict.criteria.every((c) => c.pass)) checks.push({ name: `Semantic verdict: ${verdict.category}`, passed: false, reason: "evaluator judged the answer inadequate", layer: "semantic" });
         missingIds = verdict.missingIds;
@@ -356,6 +327,8 @@ async function execute(db: DatabaseSync, provider: ModelProvider, opts: TurnOpti
     previousIds = new Set(entries.map((e) => e.id));
     return {
       missingIds,
+      verdict: verdictOut,
+      semanticReason: checks.filter((c) => !c.passed && c.layer === "semantic" && c.reason).map((c) => c.reason).join(" ").slice(0, 300),
       trace: {
         level,
         passed,
@@ -415,35 +388,113 @@ async function execute(db: DatabaseSync, provider: ModelProvider, opts: TurnOpti
   let finalResult = result;
   let fallbackLevel: 0 | 1 | 2 = 0;
 
-  // A full-context answer has nothing left to restore: the fallback ladder applies only to an optimized attempt.
+  // ---- what to do after the first evaluation: an explicit, persisted RetryDecision ----
+  // A second main-model generation is paid for only when Consolidate's context choices can plausibly have caused the failure
+  // (proven missing context, a proven applicable instruction violation, a claim tied to a compiler choice). Anything else
+  // is returned as a warning. Optional retries are also checked against the request's economics using the pricing module.
+  const expectedEval = expectedEvalUsage(repo.recentEvaluationUsage(db, HISTORY_WINDOW));
+  const optimizerSoFar = () => utilityCalls.reduce((t, c) => t + (c.costUsd ?? 0), 0);
+  const spentSoFar = () => attempts.reduce((t, a) => t + (a.trace.costUsd ?? 0), 0); // every attempt so far would end up discarded
+  const priceRetry = async (entries: CompiledEntry[], guidance?: string) => {
+    const retryCounted = await count(entries, guidance);
+    const mainModel = model ?? models.main;
+    const outTokens = final.trace.providerOutputTokens;
+    const evalCost = expectedEvaluationCostUsd(models.utility, expectedEval);
+    const gen = retryCounted != null && mainModel && outTokens != null ? usageCost(mainModel, { inputTokens: retryCounted, outputTokens: outTokens }) : null;
+    if (retryCounted == null || fullCounted == null || !mainModel || gen == null || evalCost == null) return { retryCounted, cost: null as number | null, projected: null as number | null };
+    const e = economics({ model: mainModel, fullTokens: fullCounted, compiledTokens: retryCounted, optimizerCostUsd: optimizerSoFar() + evalCost, fallbackWasteCostUsd: spentSoFar() });
+    return { retryCounted, cost: gen + evalCost, projected: e?.netSavingsUsd ?? null };
+  };
+  // User statements newer than a cited requirement (for a memory item: any message), then the current request.
+  const revisionsOf = (sourceId: string): string[] => {
+    const at = msgs.findIndex((m) => m.id === sourceId);
+    const later = at < 0 ? [] : msgs.slice(at + 1).filter((m) => m.role === "user").map((m) => m.content);
+    return [...later, request];
+  };
+  // What the attempt being judged was actually shown: information present here is not "missing".
+  let shownText = result.compiledContext.map((c) => c.content);
+  const proposeFor = (a: Attempt, alreadyRegenerated: boolean) =>
+    proposeRetry({ category: a.trace.failureCategory ?? "UNCERTAIN", verdict: a.verdict, missingIds: a.missingIds, requirements, request, semanticReason: a.semanticReason, alreadyRegenerated, revisionsOf, payloadText: shownText });
+  // Records the decision on the attempt it follows, and the warning when the evaluator flagged something Consolidate did not cause.
+  const decideOn = (a: Attempt, p: RetryProposal, d: Partial<RetryDecision> & { decision: RetryDecision["decision"]; reason: string }) => {
+    a.trace.retryDecision = { purpose: p.purpose, optional: p.optional, expectedRetryCostUsd: null, projectedNetUsd: null, economicGuard: "not_applicable", contextChanged: false, ...d };
+    if (a.verdict && (a.verdict.violation || a.verdict.contextLink || a.verdict.missingIds.length)) {
+      a.trace.evaluatorEvidence = {
+        ...(a.verdict.violation && { violation: { instruction: a.verdict.violation.instruction, sourceId: a.verdict.violation.sourceId, evidence: a.verdict.violation.evidence, appliesBecause: a.verdict.violation.appliesBecause } }),
+        ...(a.verdict.contextLink && { contextLink: a.verdict.contextLink }),
+        ...(a.verdict.missingIds.length && { candidateIds: a.verdict.missingIds }),
+      };
+    }
+    if (p.warningOnly && d.decision === "none") {
+      a.trace.warningOnly = true;
+      a.trace.qualityWarning = p.warning;
+    }
+  };
+  // Optional retries must not knowingly make the request's net savings negative; proven ones never wait on economics.
+  const guardOf = (p: RetryProposal, cost: number | null, projected: number | null) => {
+    const blocked = p.optional && projected != null && projected < 0;
+    const economicGuard: RetryDecision["economicGuard"] = !p.optional ? "not_applicable" : projected == null ? "unknown" : blocked ? "blocked" : "allowed";
+    return { blocked, economicGuard, expectedRetryCostUsd: cost, projectedNetUsd: projected };
+  };
+  const blockedReason = (p: RetryProposal, cost: number | null, projected: number | null) => `${p.reason} Skipped to protect the request's economics: the retry would cost about $${(cost ?? 0).toFixed(4)} and leave the request at ${projected != null && projected < 0 ? "−" : ""}$${Math.abs(projected ?? 0).toFixed(4)} net.`;
+
   if (!final.trace.passed && !fullPath) {
-    // Regeneration: a weak answer, a violated instruction or an unsupported claim is fixed by asking again with the
-    // SAME optimized context and a corrective instruction, never by adding history. Once only.
-    const guidance = regenerationGuidance(final);
-    if (guidance) {
-      final = await chat("regenerated", result.compiledContext, result, forced === "all", await count(result.compiledContext, guidance), guidance);
-      attempts.push(final);
-    }
-    // Level 1: restore a bounded amount of omitted context, only when the failure is one more history can fix.
-    const plan = final.trace.passed ? null : expansionPlan(final);
-    if (plan) {
-      const expanded = compileContext({ messages: msgs, request, memory: active(), semanticMatches: semanticMatches ?? {}, summaries, expansion: { ...plan, tokenBudget: EXPAND_TOKEN_BUDGET } });
-      const sameContext = expanded.compiledContext.length === result.compiledContext.length && expanded.metrics.compiledTokenEstimate === result.metrics.compiledTokenEstimate;
-      if (!sameContext) {
-        final = await chat("expanded", expanded.compiledContext, expanded, forced === "all", await count(expanded.compiledContext));
+    let step = proposeFor(final, false);
+
+    // Same-context corrective regeneration: only with proven evidence, never adds history, at most once.
+    if (step.kind === "corrective_regeneration") {
+      const price = await priceRetry(result.compiledContext, step.guidance);
+      const g = guardOf(step, price.cost, price.projected);
+      decideOn(final, step, g.blocked ? { decision: "none", reason: blockedReason(step, price.cost, price.projected), ...g } : { decision: "corrective_regeneration", reason: step.reason, ...g });
+      if (!g.blocked) {
+        final = await chat("regenerated", result.compiledContext, result, forced === "all", price.retryCounted, step.guidance);
         attempts.push(final);
-        finalResult = expanded;
-        fallbackLevel = 1;
-      }
+        step = final.trace.passed ? { kind: "none", reason: "Passed after regeneration.", optional: false, warningOnly: false } : proposeFor(final, true);
+      } else step = { kind: "none", reason: "", optional: false, warningOnly: false };
     }
+
+    // Level 1: bounded context expansion, only for failures that more context can fix.
+    if (!final.trace.passed && step.kind === "context_expansion") {
+      const expanded = compileContext({ messages: msgs, request, memory: active(), semanticMatches: semanticMatches ?? {}, summaries, expansion: { ...step.plan!, tokenBudget: EXPAND_TOKEN_BUDGET, alreadySent: result.decisions.filter((d) => d.action !== "OMIT").map((d) => d.id) } });
+      const sameContext = expanded.compiledContext.length === result.compiledContext.length && expanded.metrics.compiledTokenEstimate === result.metrics.compiledTokenEstimate;
+      if (sameContext) decideOn(final, step, { decision: "none", reason: `${step.reason} No additional omitted context was available to restore, so the context is unchanged and no retry was made.`, contextChanged: false });
+      else {
+        const price = await priceRetry(expanded.compiledContext);
+        const g = guardOf(step, price.cost, price.projected);
+        // A recovery that is functionally the full context is recorded as one: no "bounded expansion" that isn't.
+        const share = price.retryCounted != null && fullCounted ? price.retryCounted / fullCounted : expanded.metrics.compiledTokenEstimate / Math.max(1, result.metrics.originalTokenEstimate);
+        const functionallyFull = share >= FULL_EQUIVALENT_RATIO;
+        const decision = functionallyFull ? ("full_fallback" as const) : ("context_expansion" as const);
+        const reason = functionallyFull ? `${step.reason} The recovery payload is ${(share * 100).toFixed(0)}% of the full context, so it is recorded as a full fallback.` : step.reason;
+        decideOn(final, step, g.blocked ? { decision: "none", reason: blockedReason(step, price.cost, price.projected), ...g } : { decision, reason, contextChanged: true, ...g });
+        if (!g.blocked) {
+          const needed = final.semanticReason;
+          shownText = expanded.compiledContext.map((c) => c.content);
+          final = await chat("expanded", expanded.compiledContext, expanded, forced === "all", price.retryCounted);
+          if (expanded.expansionReport) final.trace.expansion = { ...expanded.expansionReport, ...(needed && { needed }) };
+          attempts.push(final);
+          finalResult = expanded;
+          fallbackLevel = 1;
+        }
+      }
+    } else if (!final.trace.retryDecision) {
+      // Nothing was retried for this attempt: record why (a warning, an unproven claim, or simply nothing to do).
+      decideOn(final, step.kind === "none" && step.reason ? step : proposeFor(final, true), { decision: "none", reason: step.reason || "No retry was justified." });
+    }
+
     // Level 2: the full context, reserved for failures that are about missing context (or a broken deterministic check).
-    if (!final.trace.passed && (final.trace.failureCategory === "MISSING_CONTEXT" || final.trace.failureCategory === "CHECK_FAILED")) {
+    if (!final.trace.passed && ((final.trace.failureCategory === "MISSING_CONTEXT" && proposeFor(final, true).kind === "context_expansion") || final.trace.failureCategory === "CHECK_FAILED")) {
+      const price = await priceRetry(fullEntries);
+      decideOn(final, { kind: "full_fallback", reason: "", optional: false, warningOnly: false }, { decision: "full_fallback", reason: "Still missing context after the bounded expansion (or no context was available to add): the full context is used.", expectedRetryCostUsd: price.cost, projectedNetUsd: price.projected, contextChanged: true });
       final = await chat("full", fullEntries, null, false, fullCounted);
       attempts.push(final);
       finalResult = result;
       fallbackLevel = 2;
     }
   }
+  // The last attempt has no further retry.
+  const last = attempts[attempts.length - 1];
+  if (!last.trace.retryDecision) last.trace.retryDecision = { decision: "none", reason: fullPath ? "The request was sent once with the full context (cost-aware fast path)." : last.trace.passed ? "Passed: no retry needed." : "No further retry.", optional: false, expectedRetryCostUsd: null, projectedNetUsd: null, economicGuard: "not_applicable", contextChanged: false };
 
   // ---- benchmark mode only: a full-context baseline to compare against the Consolidate answer ----
   let benchmark: BenchmarkResult | undefined;
@@ -501,15 +552,21 @@ async function execute(db: DatabaseSync, provider: ModelProvider, opts: TurnOpti
   tokenCount.initialCompiledTokens = initialSize.compiledTokens;
   tokenCount.initialTokensAvoided = initialSize.tokensAvoided;
   tokenCount.initialReductionPercent = initialSize.reductionPercent;
+  // The first attempt only counts as a failure when something Consolidate did (or an applicable instruction) went wrong; a warning
+  // about polish or an unproven claim is not one.
+  const firstOk = first.passed || !!first.warningOnly;
   let fallbackReason: string | undefined;
-  if (!first.passed) {
-    const regen = attempts.find((a) => a.trace.level === "regenerated");
-    const restored = attempts.find((a) => a.trace.level === "expanded")?.trace.contextAdded ?? [];
+  if (first.warningOnly) {
+    fallbackReason = `${first.qualityWarning ?? "Quality warning — no context failure detected"}. The answer was returned as it is: no context was added and it was not regenerated.`;
+  } else if (!first.passed) {
     const parts: string[] = [];
-    if (regen) parts.push(`The answer was regenerated once with the same optimized context (no history added) and ${regen.trace.passed ? "the retry passed" : "the retry did not pass"}.`);
-    if (fallbackLevel === 2) parts.push("Full context was used for the returned answer.");
-    else if (fallbackLevel === 1) parts.push(`Omitted context was restored (${restored.length} entr${restored.length === 1 ? "y" : "ies"}, ${restored.reduce((t, x) => t + x.tokens, 0)} est. tokens) and ${final.trace.passed ? "the retry passed" : "the retry did not pass; its answer was returned"}.`);
-    else if (!regen) parts.push(expansionPlan(attempts[0]) ? "No omitted context was available to restore, so the optimized answer was returned." : `No context was restored: a ${first.failureCategory} failure is not fixed by more history, so the optimized answer was returned.`);
+    for (const a of attempts.slice(1)) {
+      const d = attempts[attempts.indexOf(a) - 1]?.trace.retryDecision;
+      if (a.trace.level === "regenerated") parts.push(`${d?.purpose === "instruction" ? "Regenerated to follow an applicable instruction" : "Response regenerated with the same context"} (no context added); ${a.trace.passed ? "the retry passed" : "the retry did not pass"}.`);
+      else if (a.trace.level === "expanded") parts.push(`${d?.decision === "full_fallback" ? "Full fallback (the recovery payload was functionally the full context)" : "More context added"} (${a.trace.contextAdded?.length ?? 0} entr${a.trace.contextAdded?.length === 1 ? "y" : "ies"}, ${(a.trace.contextAdded ?? []).reduce((t, x) => t + x.tokens, 0)} est. tokens); ${a.trace.passed ? "the retry passed" : "the retry did not pass"}.`);
+      else parts.push("Full context was used for the returned answer.");
+    }
+    if (attempts.length === 1) parts.push(first.retryDecision?.reason ?? "No retry was made.");
     fallbackReason = `Optimized answer failed evaluation [${first.failureCategory}]: ${first.reason}. ${parts.join(" ")}`;
   }
 
@@ -555,7 +612,7 @@ async function execute(db: DatabaseSync, provider: ModelProvider, opts: TurnOpti
     benchmark,
     evaluation: {
       checks: first.checks,
-      passed: first.passed,
+      passed: firstOk,
       semanticEvaluatorUsed: semanticUsedFlag.used,
       semanticSkipReason: semanticUsedFlag.used ? undefined : semanticUsedFlag.skip,
       attempts: attempts.map((a) => a.trace),
@@ -592,7 +649,7 @@ async function execute(db: DatabaseSync, provider: ModelProvider, opts: TurnOpti
       reductionPercent,
       compilerLatencyMs,
       modelLatencyMs,
-      evaluationStatus: first.passed ? "PASS" : "FAIL",
+      evaluationStatus: firstOk ? "PASS" : "FAIL",
       fallbackApplied: fallbackLevel > 0,
       fallbackLevel,
       fallbackReason,
@@ -606,6 +663,11 @@ async function execute(db: DatabaseSync, provider: ModelProvider, opts: TurnOpti
       initialCompiledTokens: initialSize.compiledTokens,
       initialReductionPercent: initialSize.reductionPercent,
       failureCategory: first.failureCategory ?? "PASS",
+      retryDecision: first.retryDecision?.decision ?? "none",
+      retryDecisionReason: first.retryDecision?.reason ?? null,
+      contextChanged: first.retryDecision ? first.retryDecision.contextChanged : null,
+      expectedRetryCostUsd: first.retryDecision?.expectedRetryCostUsd ?? null,
+      qualityWarning: first.qualityWarning ?? null,
       cacheCreationTokens: usage.cacheCreationInputTokens,
       cacheReadTokens: usage.cacheReadInputTokens,
       utilityModel,
@@ -626,7 +688,7 @@ async function execute(db: DatabaseSync, provider: ModelProvider, opts: TurnOpti
   const saved = repo.getRun(db, runId)!;
   return {
     userMessage: userRow as ChatMessage,
-    assistantMessage: { ...assistantRow, runId, fallbackLevel, evaluationStatus: first.passed ? "PASS" : "FAIL", regenerated: attempts.some((a) => a.trace.level === "regenerated"), answerPassed: final.trace.passed } as ChatMessage,
+    assistantMessage: { ...assistantRow, runId, fallbackLevel, evaluationStatus: firstOk ? "PASS" : "FAIL", qualityWarning: !!first.qualityWarning, regenerated: attempts.some((a) => a.trace.level === "regenerated"), answerPassed: final.trace.passed } as ChatMessage,
     run: saved.summary,
     trace: saved.trace,
   };

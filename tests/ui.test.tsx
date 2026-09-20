@@ -20,7 +20,7 @@ beforeEach(() => {
 const isRaw = (r: { mode?: string }) => r.mode === "raw";
 const filler = (n: number) => `Answer ${n}. ` + "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda. ".repeat(20);
 const verdict = (category: string, o: { missing?: string[]; failing?: string } = {}) =>
-  JSON.stringify({ criteria: [{ name: o.failing ?? "answers_request", pass: !o.failing, reason: o.failing ? "The answer ignores the earlier project." : "ok" }], category, missing_ids: o.missing ?? [] });
+  JSON.stringify({ criteria: [{ name: o.failing ?? "answers_request", pass: !o.failing, reason: o.failing ? "The answer ignores the earlier project." : "ok" }], category, missing_context: category === "MISSING_CONTEXT" && o.missing?.length ? { missing_information: "the moon landing dates from the omitted answer", answer_problem: "the answer gives the wrong dates for the moon landing", causal_link: "the omitted answer contains the correct dates the answer needs", evidence_strength: "concrete" } : null, missing_ids: o.missing ?? [] });
 function provider(request: string, judge: (call: number) => string, counted = true) {
   let evals = 0;
   const script: Script = (req, n) => {
@@ -84,7 +84,7 @@ describe("trace summary card", () => {
     expect(t).toContain(`${pct(out.run.finalReductionPercent)} smaller`); // headline = what actually produced the answer
     expect(t).toContain(`first made this request ${pct(out.run.initialReductionPercent)} smaller`);
     expect(t).toContain("Passed after a retry");
-    expect(t).toContain("Added more context");
+    expect(t).toContain("More context added");
   });
 });
 
@@ -127,7 +127,11 @@ describe("full trace", () => {
     expect(t).toContain("Attempt 2");
     expect(t).toContain("Missing context");
     expect(t).toContain("The answer ignores the earlier project.");
-    expect(t).toMatch(/Added 2 messages/);
+    expect(t).toContain("Missing context detected");
+    expect(t).toMatch(/Needed The answer ignores the earlier project\./);
+    expect(t).toMatch(/Added .*original message/);
+    expect(t).toMatch(/Tokens added ~\d+ of a 800-token budget/);
+    expect(t).toContain("The evaluator identified this specific omitted information as necessary.");
     expect(t).toMatch(/Final\s+[\d.]+% context reduction/);
     expect(t).toContain("These are Consolidate’s first choices (attempt 1)");
   });

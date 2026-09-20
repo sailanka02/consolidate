@@ -98,7 +98,7 @@ beforeEach(() => {
 const isRaw = (r: { mode?: string }) => r.mode === "raw";
 const filler = (n: number) => `Answer ${n}. ` + "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda. ".repeat(20);
 const verdict = (category: string, o: { missing?: string[]; failing?: string; reason?: string } = {}) =>
-  JSON.stringify({ criteria: [{ name: o.failing ?? "answers_request", pass: !o.failing, reason: o.reason ?? "ok" }], category, missing_ids: o.missing ?? [] });
+  JSON.stringify({ criteria: [{ name: o.failing ?? "answers_request", pass: !o.failing, reason: o.reason ?? "ok" }], category, missing_ids: o.missing ?? [], missing_context: category === "MISSING_CONTEXT" && o.missing?.length ? { missing_information: "the moon landing dates from the omitted answer", answer_problem: "the answer gives the wrong dates for the moon landing", causal_link: "the omitted answer contains the correct dates the answer needs", evidence_strength: "concrete" } : null });
 function provider(request: string, judge: (call: number) => string) {
   let evals = 0;
   const script: Script = (req, n) => {
@@ -111,6 +111,14 @@ function provider(request: string, judge: (call: number) => string) {
   };
   return new FakeProvider(script, { api: {} });
 }
+// A concrete, applicable violation of the seeded React requirement (built lazily: it needs the seeded message's id).
+const proven = () =>
+  JSON.stringify({
+    criteria: [{ name: "honors_requirements", pass: false, reason: "recommends Vue" }],
+    category: "INSTRUCTION_VIOLATION",
+    missing_ids: [],
+    violation: { instruction: "i must use react for this", source_id: repo.listMessages(db, convId).find((m) => m.content.startsWith("i must use react"))!.id, evidence: "the answer recommends Vue", applies_to_current_request: true, applies_because: "the request asks which framework to use" },
+  });
 const seed = async (p: FakeProvider) => {
   for (const t of ["i must use react for this", "Tell me about the moon landing with dates.", "Explain how transistors work with analogies.", "Describe the history of bicycles in some detail.", "Explain what a monad is in functional programming."]) await runTurn(db, p, { conversationId: convId, content: t });
 };
@@ -154,32 +162,32 @@ describe("trace summary and attempts from real runs", () => {
     expect(s.initialPercent).toBeGreaterThan(s.percent);
     expect(s.percent).toBeGreaterThan(0);
     expect(s.quality).toMatchObject({ tone: "warn", label: "Passed after a retry" });
-    expect(s.fallback).toBe("Added more context");
+    expect(s.fallback).toBe("More context added");
 
     const [a1, a2] = buildAttempts(t);
     expect(a1).toMatchObject({ n: 1, verdict: "Missing context", passed: false, counted: true, isFinal: false });
     expect(a1.why).toContain("ignores the moon landing");
     expect(a1.percent).toBe(out.run.initialReductionPercent);
-    expect(a2).toMatchObject({ n: 2, verdict: "Passed", passed: true, isFinal: true, title: "Added more context" });
+    expect(a2).toMatchObject({ n: 2, verdict: "Passed", passed: true, isFinal: true, title: "More context added" });
     expect(a2.sent).toBeGreaterThan(a1.sent);
-    expect(a2.added).toHaveLength(2);
-    expect(a2.added![0].title).toMatch(/moon/i);
+    expect(a2.added).toHaveLength(1); // the named message only
+    expect(a2.added![0].title).toMatch(/Answer/);
     expect(a2.percent).toBe(out.run.finalReductionPercent);
     // the first attempt's decisions are the ones the cards describe, not the expanded compile
     const cards = buildDecisionCards(decisionBasis(t, 0));
     expect(cards.filter((c) => c.kind === "removed").length).toBeGreaterThan(buildDecisionCards(decisionBasis(t, 1)).filter((c) => c.kind === "removed").length);
   });
 
-  it("a regeneration is described as the same context asked again", async () => {
-    const request = "Tell me something else interesting.";
-    const p = provider(request, (call) => (call === 1 ? verdict("ANSWER_QUALITY", { failing: "answers_request", reason: "Too vague." }) : verdict("PASS")));
+  it("a corrective regeneration is described as regenerated with the same context, never as added context", async () => {
+    const request = "which frontend framework should I use?";
+    const p = provider(request, (call) => (call === 1 ? proven() : verdict("PASS")));
     await seed(p);
     const out = await runTurn(db, p, { conversationId: convId, content: request });
     const t = repo.getRun(db, out.run.id)!.trace;
     const [a1, a2] = buildAttempts(t);
-    expect(a1.verdict).toBe("Answer quality");
-    expect(a2).toMatchObject({ title: "Same context, asked again", added: [], passed: true });
-    expect(summarizeTrace(t)).toMatchObject({ regenerated: true, fallback: "Regenerated once" });
+    expect(a1.verdict).toBe("Instruction not followed");
+    expect(a2).toMatchObject({ title: "Regenerated to follow an applicable instruction", added: [], passed: true });
+    expect(summarizeTrace(t)).toMatchObject({ regenerated: true, fallback: "Regenerated to follow an applicable instruction" });
   });
 
   it("older runs without per-attempt detail are rebuilt from the stored sections and say so", async () => {
@@ -244,8 +252,8 @@ describe("trace summary and attempts from real runs", () => {
 
 describe("dashboard statistics", () => {
   it("reports where time goes and pass rates after retries, without inventing time savings", async () => {
-    const request = "Tell me something else interesting.";
-    const p = provider(request, (call) => (call === 1 ? verdict("ANSWER_QUALITY", { failing: "answers_request" }) : verdict("PASS")));
+    const request = "which frontend framework should I use?";
+    const p = provider(request, (call) => (call === 1 ? proven() : verdict("PASS")));
     await seed(p);
     await runTurn(db, p, { conversationId: convId, content: request });
     const s = repo.dashboardStats(db);

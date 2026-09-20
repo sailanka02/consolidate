@@ -349,8 +349,9 @@ function Bubble({ m, selected, onTrace, streaming }: { m: ChatMessage; selected?
             <>
               <button onClick={onTrace} className={`rounded-full px-2 py-0.5 transition-colors ${selected ? "bg-emerald-500/15 text-emerald-300" : "bg-white/[0.04] text-sky-300/80 hover:bg-white/[0.08] hover:text-sky-200"}`}>{selected ? "Showing trace" : "View trace"}</button>
               {m.evaluationStatus === "FAIL" && m.fallbackLevel === 0 && !m.regenerated && <span className="rounded-full bg-red-500/10 px-2 py-0.5 text-red-300">Quality check failed</span>}
-              {m.regenerated && <span className={`rounded-full px-2 py-0.5 ${m.answerPassed ? "bg-orange-500/10 text-orange-300" : "bg-red-500/10 text-red-300"}`}>Regenerated once{m.answerPassed ? "" : " · still failing"}</span>}
-              {!!m.fallbackLevel && <span className="rounded-full bg-orange-500/10 px-2 py-0.5 text-orange-300">{m.fallbackLevel === 1 ? "Added more context" : "Used full context"}</span>}
+              {m.qualityWarning && <span className="rounded-full bg-orange-500/10 px-2 py-0.5 text-orange-300">Quality warning</span>}
+              {m.regenerated && <span className={`rounded-full px-2 py-0.5 ${m.answerPassed ? "bg-orange-500/10 text-orange-300" : "bg-red-500/10 text-red-300"}`}>Regenerated (same context){m.answerPassed ? "" : " · still failing"}</span>}
+              {!!m.fallbackLevel && <span className="rounded-full bg-orange-500/10 px-2 py-0.5 text-orange-300">{m.fallbackLevel === 1 ? "More context added" : "Used full context"}</span>}
             </>
           )}
         </div>

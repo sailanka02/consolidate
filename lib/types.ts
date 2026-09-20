@@ -129,6 +129,7 @@ export type CompileResult = {
   // The request is a short follow-up that points back at earlier context ("what else can I add?") without naming it.
   referentialFollowUp: boolean;
   referentialObject?: ReferentialInfo;
+  expansionReport?: ExpansionReport; // present on an expansion compile (fallback level 1)
   requestTerms: string[];
 };
 
@@ -166,6 +167,44 @@ export type AttemptLevel = "optimized" | "regenerated" | "expanded" | "full";
 // a bad answer, a violated instruction or an unsupported claim is not fixed by sending more of the conversation.
 export type SemanticCategory = "PASS" | "MISSING_CONTEXT" | "ANSWER_QUALITY" | "INSTRUCTION_VIOLATION" | "UNSUPPORTED_CLAIM" | "UNCERTAIN";
 export type FailureCategory = SemanticCategory | "CHECK_FAILED"; // CHECK_FAILED = a deterministic check failed
+
+// What the engine decided to do NEXT after an attempt was evaluated. Persisted as an explicit record, never inferred later.
+//   none                     the answer is returned as it is (passed, or only a warning)
+//   context_expansion        a bounded amount of omitted context is added and the answer regenerated
+//   corrective_regeneration  the SAME context is used again with a concise corrective instruction
+//   full_fallback            the full, unoptimized context is used
+export type RetryKind = "none" | "context_expansion" | "corrective_regeneration" | "full_fallback";
+export type RetryDecision = {
+  decision: RetryKind;
+  reason: string;
+  purpose?: "context" | "instruction" | "grounding"; // why a retry was chosen (drives the wording the trace uses)
+  optional: boolean; // optional retries are economically guarded; proven MISSING_CONTEXT and applicable hard-instruction violations are not
+  expectedRetryCostUsd: number | null; // new spend for the retry (its generation + its evaluation), from the pricing module
+  projectedNetUsd: number | null; // the request's net savings if the retry were made
+  economicGuard: "not_applicable" | "allowed" | "blocked" | "unknown";
+  contextChanged: boolean; // the retry's context entries differ from the attempt it follows
+};
+
+// What a bounded recovery restored, and in which form. Information first: the cheapest faithful representation that
+// carries the missing information, not a whole historical exchange.
+export type ExpansionItem = {
+  id: string;
+  role: Role;
+  preview: string;
+  kind: "named" | "partner" | "scored"; // named by the evaluator, needed to interpret a named message, or the next best match
+  representation: "original" | "memory" | "compressed" | "already_in_payload";
+  tokens: number; // est. tokens this item added (0 when it was already in the payload)
+  skipped?: boolean; // considered but not restored (over budget)
+  score?: number;
+  why: string;
+};
+export type ExpansionReport = {
+  budgetTokens: number;
+  usedTokens: number;
+  exceededByRequired: boolean; // the named source alone exceeded the budget; nothing else was added
+  items: ExpansionItem[];
+  needed?: string; // the evaluator's description of what was missing
+};
 
 export type RoutingCounts = { keep: number; memory: number; retrieve: number; compress: number; omit: number };
 
@@ -211,6 +250,13 @@ export type AttemptTrace = {
   groups?: AttemptGroup[];
   memoryInjected?: AttemptMemory[];
   referential?: ReferentialInfo; // what "these failures"-style wording pointed at in THIS attempt's compile
+  retryDecision?: RetryDecision; // what the engine chose to do after evaluating THIS attempt
+  expansion?: ExpansionReport; // for a recovery attempt: what was restored, in which form, and why
+  // The evaluator flagged something, but not a failure caused by Consolidate's context: shown as a warning, never retried.
+  warningOnly?: boolean;
+  qualityWarning?: string;
+  // What the evaluator supplied to justify a retry, kept so a retry can be audited later.
+  evaluatorEvidence?: { violation?: { instruction: string; sourceId: string; evidence: string; appliesBecause: string }; contextLink?: { kind: string; explanation: string }; candidateIds?: string[] };
   response: string; // persisted so a failed optimized answer stays inspectable
   modelLatencyMs: number;
   providerInputTokens?: number; // ACTUAL usage reported after generation (uncached input only)
@@ -367,6 +413,7 @@ export type ChatMessage = {
   fallbackLevel?: number;
   evaluationStatus?: "PASS" | "FAIL"; // of the FIRST attempt
   regenerated?: boolean; // the answer was regenerated once with the same context
+  qualityWarning?: boolean; // an informational warning was recorded; the answer was returned as is
   answerPassed?: boolean; // whether the attempt behind the returned answer passed
 };
 
@@ -384,6 +431,10 @@ export type RunSummary = {
   initialCompiledTokens: number;
   initialReductionPercent: number;
   failureCategory: FailureCategory | null; // of the first attempt; null on older runs
+  retryDecision: RetryKind | null; // what was done after the first attempt (null on older runs)
+  contextChanged: boolean | null; // whether that retry changed the context (null when there was none / older runs)
+  expectedRetryCostUsd: number | null;
+  qualityWarning: string | null; // set when the first attempt drew a warning that Consolidate did not act on
   compilerLatencyMs: number;
   modelLatencyMs: number;
   evaluationStatus: "PASS" | "FAIL";

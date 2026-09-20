@@ -196,6 +196,14 @@ const MIGRATIONS: string[] = [
   ALTER TABLE compiler_run ADD COLUMN economics_source TEXT;
   ALTER TABLE compiler_run ADD COLUMN potential_compiled_tokens INTEGER;
   `,
+  // v5: the explicit retry decision after the first attempt, and the informational quality warning. Additive only.
+  `
+  ALTER TABLE compiler_run ADD COLUMN retry_decision TEXT;
+  ALTER TABLE compiler_run ADD COLUMN retry_decision_reason TEXT;
+  ALTER TABLE compiler_run ADD COLUMN expected_retry_cost_usd REAL;
+  ALTER TABLE compiler_run ADD COLUMN context_changed INTEGER;
+  ALTER TABLE compiler_run ADD COLUMN quality_warning TEXT;
+  `,
 ];
 
 export function migrate(db: DatabaseSync) {

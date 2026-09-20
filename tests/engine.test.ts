@@ -190,7 +190,7 @@ describe("evaluation and fallback", () => {
     expect(out.assistantMessage.content).toBe(out.trace.evaluation.attempts[2].response);
   });
 
-  it("treats a semantic evaluator failure verdict as a failed attempt and reports the missing context", async () => {
+  it("a missing-context claim with no evidence is reported as a warning: no retry, no fallback", async () => {
     let evals = 0;
     const p = new FakeProvider(
       base((req) => {
@@ -204,8 +204,10 @@ describe("evaluation and fallback", () => {
     );
     await seed(p);
     const out = await say(p, "Who may receive customer emails?");
-    expect(out.trace.evaluation.fallbackLevel).toBe(1);
-    expect(out.trace.evaluation.checks.some((c) => c.layer === "semantic" && !c.passed)).toBe(true);
+    expect(out.trace.evaluation.fallbackLevel).toBe(0);
+    expect(out.trace.evaluation.attempts).toHaveLength(1);
+    expect(out.trace.evaluation.attempts[0]).toMatchObject({ warningOnly: true, failureCategory: "MISSING_CONTEXT" });
+    expect(out.trace.evaluation.checks.some((c) => c.layer === "semantic" && !c.passed)).toBe(true); // still reported honestly
   });
 
   it("skips the semantic evaluator when nothing was removed", async () => {

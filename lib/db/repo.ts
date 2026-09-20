@@ -61,7 +61,7 @@ const toMessage = (r: Row): ChatMessage => ({
   content: r.content as string,
   createdAt: r.created_at as string,
   localTokenEstimate: r.local_token_estimate as number,
-  ...(r.run_id ? { runId: r.run_id as string, fallbackLevel: r.fallback_level as number, evaluationStatus: r.evaluation_status as "PASS" | "FAIL", regenerated: !!r.regenerated, answerPassed: !!r.answer_passed } : {}),
+  ...(r.run_id ? { runId: r.run_id as string, fallbackLevel: r.fallback_level as number, evaluationStatus: r.evaluation_status as "PASS" | "FAIL", regenerated: !!r.regenerated, answerPassed: !!r.answer_passed, qualityWarning: !!r.quality_warning } : {}),
 });
 
 export const listMessages = (db: DatabaseSync, conversationId: string): ChatMessage[] =>
@@ -70,7 +70,8 @@ export const listMessages = (db: DatabaseSync, conversationId: string): ChatMess
       .prepare(
         `SELECT m.*, r.id AS run_id, r.fallback_level, r.evaluation_status,
            EXISTS (SELECT 1 FROM run_attempt a WHERE a.run_id = r.id AND a.level = 'regenerated') AS regenerated,
-           (SELECT a.passed FROM run_attempt a WHERE a.run_id = r.id ORDER BY a.idx DESC LIMIT 1) AS answer_passed
+           (SELECT a.passed FROM run_attempt a WHERE a.run_id = r.id ORDER BY a.idx DESC LIMIT 1) AS answer_passed,
+           (r.quality_warning IS NOT NULL) AS quality_warning
          FROM message m
          LEFT JOIN compiler_run r ON r.assistant_message_id = m.id
          WHERE m.conversation_id = ? ORDER BY m.seq`,
@@ -220,6 +221,11 @@ export type RunInput = {
   initialCompiledTokens: number;
   initialReductionPercent: number;
   failureCategory: FailureCategory;
+  retryDecision: string;
+  retryDecisionReason: string | null;
+  contextChanged: boolean | null;
+  expectedRetryCostUsd: number | null;
+  qualityWarning: string | null;
   cacheCreationTokens: number | null;
   cacheReadTokens: number | null;
   utilityModel: string | null;
@@ -250,18 +256,18 @@ export function insertRun(db: DatabaseSync, r: RunInput) {
   );
   r.attempts.forEach((a, i) => {
     att.run(r.id, i, a.level, a.passed ? 1 : 0, a.reason, a.contextTokens, a.response, a.modelLatencyMs, a.providerInputTokens ?? null, a.providerOutputTokens ?? null);
-    const detail = { fullCountedTokens: a.fullCountedTokens ?? null, reductionPercent: a.reductionPercent ?? null, routing: a.routing ?? null, missingIds: a.missingIds ?? [], contextAdded: a.contextAdded ?? null, decisions: a.decisions ?? null };
+    const detail = { retryDecision: a.retryDecision ?? null, warningOnly: a.warningOnly ?? false, qualityWarning: a.qualityWarning ?? null, fullCountedTokens: a.fullCountedTokens ?? null, reductionPercent: a.reductionPercent ?? null, routing: a.routing ?? null, missingIds: a.missingIds ?? [], contextAdded: a.contextAdded ?? null, decisions: a.decisions ?? null };
     attExtra.run(a.countedInputTokens ?? null, a.cacheCreationInputTokens ?? null, a.cacheReadInputTokens ?? null, a.costUsd ?? null, a.model ?? null, a.failureCategory ?? null, JSON.stringify(detail), r.id, i);
   });
   const c = r.costs;
   db.prepare(
-    `UPDATE compiler_run SET initial_compiled_tokens = ?, initial_reduction_percent = ?, failure_category = ?, count_source = ?, count_error = ?, full_estimate_tokens = ?, compiled_estimate_tokens = ?, cache_creation_tokens = ?, cache_read_tokens = ?,
+    `UPDATE compiler_run SET retry_decision = ?, retry_decision_reason = ?, expected_retry_cost_usd = ?, context_changed = ?, quality_warning = ?, initial_compiled_tokens = ?, initial_reduction_percent = ?, failure_category = ?, count_source = ?, count_error = ?, full_estimate_tokens = ?, compiled_estimate_tokens = ?, cache_creation_tokens = ?, cache_read_tokens = ?,
        pricing_model = ?, utility_model = ?, full_input_cost_usd = ?, compiled_input_cost_usd = ?, gross_input_savings_usd = ?, optimizer_cost_usd = ?,
        fallback_waste_cost_usd = ?, net_savings_usd = ?, generation_cost_usd = ?, generation_input_cost_usd = ?, generation_output_cost_usd = ?, benchmark_json = ?,
        economic_decision = ?, economic_reason = ?, expected_gross_savings_usd = ?, expected_evaluation_cost_usd = ?, economics_margin = ?, economics_source = ?, potential_compiled_tokens = ?
      WHERE id = ?`,
   ).run(
-    r.initialCompiledTokens, r.initialReductionPercent, r.failureCategory, r.countSource, r.countError ?? null, r.fullEstimateTokens, r.compiledEstimateTokens, r.cacheCreationTokens, r.cacheReadTokens,
+    r.retryDecision, r.retryDecisionReason, r.expectedRetryCostUsd, r.contextChanged == null ? null : r.contextChanged ? 1 : 0, r.qualityWarning, r.initialCompiledTokens, r.initialReductionPercent, r.failureCategory, r.countSource, r.countError ?? null, r.fullEstimateTokens, r.compiledEstimateTokens, r.cacheCreationTokens, r.cacheReadTokens,
     c?.pricingModel ?? null, r.utilityModel, c?.fullInputCostUsd ?? null, c?.compiledInputCostUsd ?? null, c?.grossInputSavingsUsd ?? null, c?.optimizerCostUsd ?? null,
     c?.fallbackWasteCostUsd ?? null, c?.netSavingsUsd ?? null, c?.generationCostUsd ?? null, c?.generationInputCostUsd ?? null, c?.generationOutputCostUsd ?? null,
     r.benchmark ? JSON.stringify(r.benchmark) : null,
@@ -292,6 +298,10 @@ const toRun = (r: Row): RunSummary => ({
   initialCompiledTokens: (r.initial_compiled_tokens as number | null) ?? (r.compiled_tokens as number),
   initialReductionPercent: (r.initial_reduction_percent as number | null) ?? (r.reduction_percent as number),
   failureCategory: (r.failure_category as FailureCategory | null) ?? null,
+  retryDecision: (r.retry_decision as RunSummary["retryDecision"]) ?? null,
+  contextChanged: r.context_changed == null ? null : !!r.context_changed,
+  expectedRetryCostUsd: (r.expected_retry_cost_usd as number | null) ?? null,
+  qualityWarning: (r.quality_warning as string | null) ?? null,
   compilerLatencyMs: r.compiler_latency_ms as number,
   modelLatencyMs: r.model_latency_ms as number,
   evaluationStatus: r.evaluation_status as "PASS" | "FAIL",
@@ -441,7 +451,7 @@ export function dashboardStats(db: DatabaseSync): DashboardStats {
   const extra = one(
     `SELECT (SELECT AVG(json_extract(trace_json, '$.compilation.tokenCount.latencyMs')) FROM compiler_run) AS tc,
             (SELECT COALESCE(SUM(latency_ms), 0) FROM utility_call) AS ul,
-            (SELECT COUNT(*) FROM run_attempt a WHERE a.passed = 1 AND a.idx = (SELECT MAX(idx) FROM run_attempt WHERE run_id = a.run_id)) AS fp,
+            (SELECT COUNT(*) FROM run_attempt a WHERE (a.passed = 1 OR json_extract(a.detail_json, '$.warningOnly') = 1) AND a.idx = (SELECT MAX(idx) FROM run_attempt WHERE run_id = a.run_id)) AS fp,
             (SELECT COUNT(DISTINCT run_id) FROM run_attempt WHERE level = 'regenerated') AS rg`,
   );
   const bench = one(

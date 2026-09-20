@@ -50,3 +50,11 @@ describe("database persistence across restarts", () => {
     b.close();
   });
 });
+
+describe("test isolation", () => {
+  it("the default database path used by tests is a throwaway file, never the real .consolidate database", () => {
+    const path = process.env.CONSOLIDATE_DB_PATH ?? "";
+    expect(path).toContain("consolidate-vitest-");
+    expect(path).not.toContain(".consolidate");
+  });
+});

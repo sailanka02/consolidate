@@ -1,6 +1,6 @@
 // Plain-language view of a stored Context Trace. Pure and client-safe: it only reads persisted trace data and never
 // invents numbers. Every card keeps the technical fields it was derived from, so the UI can offer them on demand.
-import type { Action, AttemptDecision, AttemptGroup, AttemptMemory, AttemptTrace, ContextTrace, FailureCategory, ReferentialInfo, Role } from "../types";
+import type { Action, AttemptDecision, AttemptGroup, AttemptMemory, AttemptTrace, ContextTrace, FailureCategory, ReferentialInfo, RetryDecision, RetryKind, Role } from "../types";
 
 export type CardKind = "kept" | "remembered" | "brought_back" | "compressed" | "removed";
 
@@ -211,11 +211,13 @@ export function summarizeTrace(t: ContextTrace): TraceSummary {
   const regen = ev.attempts.some((a) => a.level === "regenerated");
   const finalPassed = last ? last.passed : ev.status === "PASS";
   const parts: string[] = [];
-  if (regen) parts.push("Regenerated once");
-  if (ev.fallbackLevel === 1) parts.push("Added more context");
+  const regenAttempt = ev.attempts.findIndex((a) => a.level === "regenerated");
+  if (regen) parts.push(ev.attempts[regenAttempt - 1]?.retryDecision?.purpose === "instruction" ? "Regenerated to follow an applicable instruction" : "Response regenerated with the same context");
+  if (ev.fallbackLevel === 1) parts.push(ev.attempts.some((a) => a.retryDecision?.decision === "full_fallback") ? "Full fallback" : "More context added");
   if (ev.fallbackLevel === 2) parts.push("Used the full context");
   let quality: Quality;
-  if (ev.status === "PASS") quality = { tone: "good", label: "Passed", detail: "No fallback required" };
+  if (ev.attempts[0]?.warningOnly) quality = { tone: "warn", label: "Passed with a quality warning", detail: "No context failure detected; the answer was returned as it is" };
+  else if (ev.status === "PASS") quality = { tone: "good", label: "Passed", detail: "No fallback required" };
   else if (finalPassed) quality = { tone: "warn", label: "Passed after a retry", detail: parts.join(" · ") || "Retried" };
   else quality = { tone: "bad", label: "Did not pass", detail: parts.length ? `${parts.join(" · ")}; the last answer still failed the check` : "The answer was returned but failed the check" };
   return {
@@ -270,8 +272,8 @@ export const CATEGORY_LABEL: Record<FailureCategory, string> = {
 
 const LEVEL_TITLE: Record<AttemptTrace["level"], string> = {
   optimized: "Optimized context",
-  regenerated: "Same context, asked again",
-  expanded: "Added more context",
+  regenerated: "Response regenerated with the same context",
+  expanded: "More context added",
   full: "Full context",
 };
 
@@ -292,7 +294,14 @@ export type AttemptView = {
   routing: AttemptTrace["routing"] | null;
   response: string;
   isFinal: boolean;
+  // What the engine decided after this attempt, stated plainly (never inferred from other fields).
+  recovery: { needed: string | null; added: { title: string; representation: string; tokens: number; kind: string; why: string; skipped: boolean }[]; tokensAdded: number; exceeded: boolean; budget: number } | null;
+  retry: { decision: RetryKind; label: string; reason: string; contextChanged: boolean; expectedCostUsd: number | null } | null;
+  warning: string | null;
 };
+
+const RETRY_LABEL = (d: RetryDecision): string =>
+  d.decision === "context_expansion" ? "More context added" : d.decision === "full_fallback" ? "Full fallback" : d.decision === "corrective_regeneration" ? (d.purpose === "instruction" ? "Regenerated to follow an applicable instruction" : "Response regenerated with the same context") : "No retry";
 
 export function buildAttempts(t: ContextTrace): AttemptView[] {
   const previews = new Map<string, string>([...t.classification.items.map((i) => [i.id, i.preview] as const), ...t.evaluation.attempts.flatMap((a) => (a.decisions ?? []).map((d) => [d.id, d.preview ?? ""] as const))]);
@@ -306,7 +315,7 @@ export function buildAttempts(t: ContextTrace): AttemptView[] {
     return {
       n: i + 1,
       level: a.level,
-      title: LEVEL_TITLE[a.level],
+      title: a.level === "regenerated" && all[i - 1]?.retryDecision?.purpose === "instruction" ? "Regenerated to follow an applicable instruction" : a.level === "expanded" && all[i - 1]?.retryDecision?.decision === "full_fallback" ? "Full fallback" : LEVEL_TITLE[a.level],
       full: counted ? fullCounted : null,
       sent: counted ? a.countedInputTokens! : a.contextTokens,
       counted,
@@ -320,6 +329,9 @@ export function buildAttempts(t: ContextTrace): AttemptView[] {
       routing: a.routing ?? null,
       response: a.response,
       isFinal: i === all.length - 1,
+      recovery: a.expansion ? { needed: a.expansion.needed ?? null, added: a.expansion.items.map((x) => ({ title: quote(x.preview), representation: x.representation, tokens: x.tokens, kind: x.kind, why: x.why, skipped: !!x.skipped })), tokensAdded: a.expansion.usedTokens, exceeded: a.expansion.exceededByRequired, budget: a.expansion.budgetTokens } : null,
+      retry: a.retryDecision ? { decision: a.retryDecision.decision, label: a.warningOnly ? "Quality warning — no context failure detected" : RETRY_LABEL(a.retryDecision), reason: a.retryDecision.reason, contextChanged: a.retryDecision.contextChanged, expectedCostUsd: a.retryDecision.expectedRetryCostUsd } : null,
+      warning: a.warningOnly ? (a.qualityWarning ?? "Quality warning — no context failure detected") : null,
     };
   });
 }

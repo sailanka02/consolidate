@@ -19,6 +19,7 @@ const verdict = (category: string, o: { missing?: string[]; failing?: string } =
     criteria: [{ name: o.failing ?? "answers_request", pass: !o.failing, reason: o.failing ? "flagged by evaluator" : "ok" }],
     category,
     missing_ids: o.missing ?? [],
+    missing_context: category === "MISSING_CONTEXT" && o.missing?.length ? { missing_information: "the moon landing dates from the omitted answer", answer_problem: "the answer gives the wrong dates for the moon landing", causal_link: "the omitted answer contains the correct dates the answer needs", evidence_strength: "concrete" } : null,
   });
 
 let db: DatabaseSync;
@@ -70,14 +71,17 @@ describe("semantic evaluator: protected requirements are conditional, not mandat
     const prompt = evalPrompts(p, before)[0].request;
     expect(prompt).toContain("i must use react for this");
     expect(prompt).toMatch(/each applies only when the current request concerns its subject/);
-    expect(prompt).toMatch(/never (has )?to mention or restate/);
-    expect(prompt).toMatch(/materially incomplete FOR THE CURRENT REQUEST/);
+    expect(prompt).toMatch(/not mentioning a requirement is never a violation/);
+    expect(prompt).toMatch(/A historical requirement about an unrelated subject never applies/);
+    expect(prompt).toMatch(/You are NOT a general answer critic/);
+    expect(prompt).toMatch(/An answer that could be improved but is safe and adequate is PASS/);
+    expect(prompt).toContain('"id":"m_'); // requirements carry ids, so a claimed violation must cite a real source
     // ...while the deterministic guarantee still holds: the protected message was sent verbatim.
     expect(chatCalls(p, before)[0].context.some((c) => c.content === "i must use react for this")).toBe(true);
     expect(out.trace.evaluation.checks.find((c) => c.name === "Protected context retained verbatim")?.passed).toBe(true);
   });
 
-  it("keeps the React constraint in front of the model for a request it applies to, and enforces it", async () => {
+  it("keeps the React constraint in front of the model for a request it applies to; an unproven violation is only a warning", async () => {
     const request = "which frontend framework should I use?";
     // No lexical overlap with the constraint, so only protection keeps it in context.
     const p = provider(request, () => verdict("INSTRUCTION_VIOLATION", { failing: "honors_requirements" }));
@@ -89,65 +93,23 @@ describe("semantic evaluator: protected requirements are conditional, not mandat
     expect(sent.some((c) => c.content === "i must use react for this")).toBe(true);
     expect(evalPrompts(p, before)[0].request).toContain("i must use react for this");
     expect(out.trace.protection.items.map((i) => i.preview)).toContain("i must use react for this");
-    // A violated instruction is regenerated once with a corrective instruction; the constraint was already in context, so no history is added.
-    expect(out.run).toMatchObject({ evaluationStatus: "FAIL", failureCategory: "INSTRUCTION_VIOLATION", fallbackLevel: 0, fallbackApplied: false });
-    const chats = chatCalls(p, before);
-    expect(chats).toHaveLength(2);
-    expect(chats[1].context.map((c) => c.id)).toEqual(chats[0].context.map((c) => c.id));
-    expect(chats[1].context.some((c) => c.content === "i must use react for this")).toBe(true);
-    expect(chats[1].guidance).toMatch(/follow every requirement/);
+    // The evaluator gave no exact instruction, source or evidence, so nothing was retried: a warning, one generation, no waste.
+    expect(chatCalls(p, before)).toHaveLength(1);
+    expect(out.run).toMatchObject({ evaluationStatus: "PASS", failureCategory: "INSTRUCTION_VIOLATION", fallbackLevel: 0, fallbackApplied: false, retryDecision: "none" });
+    expect(out.trace.evaluation.attempts[0].warningOnly).toBe(true);
   });
 });
 
 describe("failure category decides whether context is restored", () => {
-  it.each([
-    ["ANSWER_QUALITY", /directly and completely/],
-    ["INSTRUCTION_VIOLATION", /follow every requirement/],
-    ["UNSUPPORTED_CLAIM", /ground every statement/],
-  ] as const)("%s regenerates once with the same optimized context and never adds history", async (category, wording) => {
-    const request = "Tell me something else interesting.";
-    const p = provider(request, () => verdict(category, { failing: "answers_request" })); // still failing after the retry
-    await seedReact(p);
-    const before = p.calls.length;
-    const out = await say(p, request);
+  // ANSWER_QUALITY / INSTRUCTION_VIOLATION / UNSUPPORTED_CLAIM / UNCERTAIN retry policy: see tests/retry.test.ts.
 
-    const chats = chatCalls(p, before);
-    expect(chats).toHaveLength(2); // exactly one regeneration: no second retry, no expanded retry, no full-context retry
-    expect(out.trace.evaluation.attempts.map((a) => a.level)).toEqual(["optimized", "regenerated"]);
-    expect(chats[0].guidance).toBeUndefined();
-    expect(chats[1].guidance).toMatch(wording);
-    expect(chats[1].context).toEqual(chats[0].context); // identical context: nothing restored
-    expect(out.trace.evaluation.attempts[1].contextAdded).toEqual([]);
-    expect(out.run).toMatchObject({ evaluationStatus: "FAIL", failureCategory: category, fallbackLevel: 0, fallbackApplied: false });
-    expect(out.assistantMessage.content).toBe(out.trace.evaluation.attempts[1].response); // the regenerated answer is returned
-    expect(out.run.tokensAvoided).toBeGreaterThan(0);
-    expect(out.trace.evaluation.fallbackReason).toMatch(/regenerated once with the same optimized context \(no history added\)/);
-    // The guidance is part of the counted payload, so the final numbers include its cost.
-    expect(p.counted.some((c) => c.guidance === chats[1].guidance)).toBe(true);
-    expect(out.trace.evaluation.attempts[1].countedInputTokens!).toBeGreaterThan(out.trace.evaluation.attempts[0].countedInputTokens!);
-    expect(out.run.finalReductionPercent).toBeGreaterThan(0);
-  });
-
-  it("a passing regeneration is returned, is flagged on the message, and costs no history", async () => {
-    const request = "Tell me something else interesting.";
-    const p = provider(request, (call) => (call === 1 ? verdict("UNSUPPORTED_CLAIM", { failing: "answers_request" }) : verdict("PASS")));
-    await seedReact(p);
-    const before = p.calls.length;
-    const out = await say(p, request);
-    expect(chatCalls(p, before)).toHaveLength(2);
-    expect(out.assistantMessage).toMatchObject({ regenerated: true, answerPassed: true });
-    expect(out.run).toMatchObject({ evaluationStatus: "FAIL", failureCategory: "UNSUPPORTED_CLAIM", fallbackLevel: 0 }); // status reports the FIRST attempt
-    const stored = repo.listMessages(db, convId).at(-1)!;
-    expect(stored).toMatchObject({ regenerated: true, answerPassed: true });
-    expect(out.trace.evaluation.fallbackReason).toMatch(/the retry passed/);
-    // Discarded first answer is accounted for as waste.
-    expect(out.run.costs?.fallbackWasteCostUsd ?? 0).toBeGreaterThan(0);
-  });
-
-  it("escalates to bounded expansion only if the regenerated answer then fails for missing context", async () => {
+  it("a proven instruction violation that is then followed by missing context escalates to bounded expansion", async () => {
     const request = "Tell me something else interesting.";
     const p = provider(request, (call) => {
-      if (call === 1) return verdict("ANSWER_QUALITY", { failing: "answers_request" });
+      if (call === 1) {
+        const react = repo.listMessages(db, convId).find((m) => m.content.startsWith("i must use react"))!.id;
+        return JSON.stringify({ criteria: [{ name: "honors_requirements", pass: false, reason: "x" }], category: "INSTRUCTION_VIOLATION", missing_ids: [], violation: { instruction: "i must use react for this", source_id: react, evidence: "recommends Vue", applies_to_current_request: true, applies_because: "framework question" } });
+      }
       if (call === 2) {
         const msgs = repo.listMessages(db, convId);
         const i = msgs.findIndex((m) => m.content.startsWith("Tell me about the moon"));
@@ -161,7 +123,7 @@ describe("failure category decides whether context is restored", () => {
     expect(chatCalls(p, before)).toHaveLength(3);
     expect(out.trace.evaluation.attempts.map((a) => a.level)).toEqual(["optimized", "regenerated", "expanded"]);
     expect(out.run.fallbackLevel).toBe(1);
-    expect(out.trace.evaluation.attempts[2].contextAdded).toHaveLength(2); // the named message and its pair, nothing else
+    expect(out.trace.evaluation.attempts[2].contextAdded).toHaveLength(1); // only the named message: its question is self-contained, so it is not restored
     expect(out.run.finalReductionPercent).toBeGreaterThan(0);
   });
 
@@ -181,14 +143,14 @@ describe("failure category decides whether context is restored", () => {
     expect(chatCalls(unc, b2).every((c) => c.guidance === undefined)).toBe(true);
   });
 
-  it("MISSING_CONTEXT naming one omitted message restores that message and its pair, not the rest of the history", async () => {
+  it("MISSING_CONTEXT naming one omitted message restores that message only (its partner is not needed to interpret it), not the rest of the history", async () => {
     const request = "Tell me something else interesting.";
     let target = "";
     const p = provider(request, (call) => {
       if (call > 1) return verdict("PASS");
       const msgs = repo.listMessages(db, convId);
       const moonUser = msgs.findIndex((m) => m.content.startsWith("Tell me about the moon"));
-      target = msgs[moonUser + 1].id; // the moon ANSWER; its question is the pair
+      target = msgs[moonUser + 1].id; // the moon ANSWER; its question is self-contained, so it stays out
       return verdict("MISSING_CONTEXT", { failing: "no_missing_context", missing: [target] });
     });
     await seedReact(p);
@@ -201,7 +163,8 @@ describe("failure category decides whether context is restored", () => {
     expect(chats).toHaveLength(2);
     const optimizedIds = chats[0].context.map((c) => c.id);
     const expandedIds = chats[1].context.map((c) => c.id);
-    expect(expandedIds.filter((id) => !optimizedIds.includes(id)).sort()).toEqual([target, moonUser.id].sort());
+    expect(expandedIds.filter((id) => !optimizedIds.includes(id))).toEqual([target]);
+    expect(expandedIds).not.toContain(moonUser.id);
     // The other omitted history (transistors, bicycles) stays out: fewer than 6 omitted messages no longer means "restore all".
     expect(expandedIds.length).toBeLessThan(msgs.length - 2);
     expect(out.run).toMatchObject({ evaluationStatus: "FAIL", failureCategory: "MISSING_CONTEXT", fallbackLevel: 1, fallbackApplied: true });
@@ -209,9 +172,10 @@ describe("failure category decides whether context is restored", () => {
     expect(out.run.finalReductionPercent).toBeLessThan(out.run.initialReductionPercent);
   });
 
-  it("MISSING_CONTEXT with no ids restores best-scoring omitted messages within the budget, then falls back to full only if that also fails", async () => {
+  it("a concrete missing-context claim that is still concrete after the bounded expansion falls back to full only then", async () => {
     const request = "Tell me something else interesting.";
-    const p = provider(request, () => verdict("MISSING_CONTEXT", { failing: "no_missing_context" })); // fails every time
+    const reply = (starts: string) => { const m = repo.listMessages(db, convId); return m[m.findIndex((x) => x.content.startsWith(starts)) + 1].id; };
+    const p = provider(request, (call) => verdict("MISSING_CONTEXT", { failing: "no_missing_context", missing: [reply(call === 1 ? "Tell me about the moon" : "Explain how transistors")] })); // a different omitted source each time
     await seedReact(p);
     const before = p.calls.length;
     const out = await say(p, request);
@@ -234,18 +198,6 @@ describe("failure category decides whether context is restored", () => {
     const o1 = await say(p1, unrelated);
     expect(chatCalls(p1, b1)).toHaveLength(1);
     expect(o1.run).toMatchObject({ failureCategory: "UNCERTAIN", fallbackLevel: 0 });
-  });
-
-  it("UNCERTAIN expands once (no full-context retry) when a lexically related omitted message exists", async () => {
-    const request = "How do bicycles work?";
-    const p = provider(request, () => verdict("UNCERTAIN")); // uncertain on every attempt
-    await seedReact(p);
-    const before = p.calls.length;
-    const out = await say(p, request);
-    expect(chatCalls(p, before)).toHaveLength(2);
-    expect(out.trace.evaluation.attempts.map((a) => a.level)).toEqual(["optimized", "expanded"]);
-    expect(out.run.fallbackLevel).toBe(1);
-    expect(out.run.finalReductionPercent).toBeGreaterThan(0);
   });
 });
 
@@ -287,7 +239,7 @@ describe("savings and trace", () => {
     expect(a1.response).not.toBe(a0.response);
     expect(a1.countedInputTokens!).toBeGreaterThan(a0.countedInputTokens!);
     expect(a1.countedInputTokens!).toBeLessThan(a0.fullCountedTokens!);
-    expect(a1.contextAdded!.length).toBe(2);
+    expect(a1.contextAdded!.length).toBe(1);
     expect(a1.routing!.omit).toBeLessThan(a0.routing!.omit);
     expect(a1.reductionPercent).toBe(out.run.finalReductionPercent);
 
@@ -295,7 +247,7 @@ describe("savings and trace", () => {
     const rows = db.prepare("SELECT idx, level, failure_category, counted_input_tokens, detail_json FROM run_attempt WHERE run_id = ? ORDER BY idx").all(out.run.id) as { idx: number; level: string; failure_category: string; counted_input_tokens: number; detail_json: string }[];
     expect(rows.map((r) => [r.level, r.failure_category])).toEqual([["optimized", "MISSING_CONTEXT"], ["expanded", "PASS"]]);
     expect(JSON.parse(rows[0].detail_json).routing.omit).toBe(a0.routing!.omit);
-    expect(JSON.parse(rows[1].detail_json).contextAdded).toHaveLength(2);
+    expect(JSON.parse(rows[1].detail_json).contextAdded).toHaveLength(1);
 
     // the run distinguishes the two reductions and never claims the initial one for the final request
     expect(stored.summary.initialCompiledTokens).toBe(a0.countedInputTokens);
@@ -325,10 +277,10 @@ describe("expansion policy (compiler)", () => {
     expect(r.metrics.retrieveCount).toBe(2);
   });
 
-  it("restores only the named ids plus their pair; never the top-N of everything omitted", () => {
+  it("restores only the named ids (a partner only when required); never the top-N of everything omitted", () => {
     const r = compileContext({ messages, request, expansion: { includeIds: ["m3"], tokenBudget: 100_000 } });
-    expect(r.decisions.filter((d) => d.reason.startsWith("Restored")).map((d) => d.id).sort()).toEqual(["m2", "m3"]);
-    expect(r.metrics.omitCount).toBe(6); // 6 omitted messages remain even though 6 is the old blanket count
+    expect(r.decisions.filter((d) => d.reason.startsWith("Restored")).map((d) => d.id)).toEqual(["m3"]);
+    expect(r.metrics.omitCount).toBe(7); // the other omitted messages stay out, including the adjacent question m2
   });
 
   it("does nothing beyond the named ids when incremental mode is off", () => {
