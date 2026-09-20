@@ -9,7 +9,8 @@
     "lint": "eslint",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "backup": "node scripts/backup-db.mjs"
+    "backup": "node scripts/backup-db.mjs",
+    "seed:demos": "vitest run --config scripts/seed.vitest.config.mts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.127.0",
