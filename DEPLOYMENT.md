@@ -73,6 +73,18 @@ Nothing has been deployed and no Railway account was touched.
 10. **Settings → Networking → Generate Domain** (a public domain on `*.up.railway.app`). If it asks for a port, use the one Railway
     detected. This gives you the final **HTTPS URL**.
 
+### Optional: preload the two measured demo conversations
+
+`demo-data/demos.db` holds "Demo — Enterprise Employee" and "Demo — Mom & Pop Website" with their real, provider-counted runs (synthetic
+conversations, no secrets). After the first successful deploy (so the app has created and migrated `/data/consolidate.db`), run once:
+
+```bash
+railway ssh
+npm run import-demos -- /data/consolidate.db
+```
+
+It is idempotent, adds rows only, and runs in a single transaction. Locally: `npm run import-demos` (uses `CONSOLIDATE_DB_PATH`).
+
 ### Part 4: check it like a judge would
 
 11. Open the URL in an **incognito/private window**. You should see the **Demo access** login screen and nothing else.

@@ -10,6 +10,7 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "backup": "node scripts/backup-db.mjs",
+    "import-demos": "node scripts/import-demos.mjs",
     "seed:demos": "vitest run --config scripts/seed.vitest.config.mts"
   },
   "dependencies": {

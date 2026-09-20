@@ -52,6 +52,7 @@ next-env.d.ts
 *.db-wal
 *.db-shm
 *.db-journal
+!/demo-data/demos.db
 /backups/
 
 # generated demo metrics and seed database
